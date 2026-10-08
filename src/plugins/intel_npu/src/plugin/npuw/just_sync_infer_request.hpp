@@ -125,6 +125,7 @@ protected:
     void bind_global_parameters(std::size_t idx);
     void bind_global_results(std::size_t idx);
     using IBaseInferRequest::bind_global_results;
+    void copy_prev_outputs_to_subrequest_inputs(std::size_t idx);
     bool bind_behavior_input(std::size_t idx,
                              std::size_t real_idx,
                              std::size_t input_idx,
@@ -132,6 +133,7 @@ protected:
                              RqPtr request) override;
 
     void function_prologue(std::size_t idx);
+    void function_epilogue(std::size_t idx);
 
     void unsafe_during(std::size_t real_idx, std::size_t idx, const std::function<void()>& f);
     void unsafe_infer(std::size_t real_idx, std::size_t idx);

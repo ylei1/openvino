@@ -24,6 +24,41 @@
 #include "v1/elements/failsafe.hpp"
 #include "weights_bank.hpp"
 
+namespace {
+
+bool should_copy_inter_request_tensor(const ov::Output<const ov::Node>& port) {
+    return port.get_element_type() == ov::element::boolean;
+}
+
+void copy_tensor_to_request_input(const ov::Output<const ov::Node>& input_port,
+                                  const ov::SoPtr<ov::ITensor>& src_tensor,
+                                  const ov::SoPtr<ov::IAsyncInferRequest>& dst_request) {
+    const auto dst_tensor = dst_request->get_tensor(input_port);
+    OPENVINO_ASSERT(src_tensor->get_byte_size() == dst_tensor->get_byte_size(),
+                    "Inter-subgraph tensor byte size mismatch: source=",
+                    src_tensor->get_byte_size(),
+                    ", destination=",
+                    dst_tensor->get_byte_size());
+    src_tensor->copy_to(dst_tensor._ptr);
+}
+
+void copy_request_output_to_tensor(const ov::Output<const ov::Node>& output_port,
+                                   const ov::SoPtr<ov::IAsyncInferRequest>& src_request,
+                                   const ov::SoPtr<ov::ITensor>& dst_tensor) {
+    const auto src_tensor = src_request->get_tensor(output_port);
+    if (src_tensor._ptr == dst_tensor._ptr) {
+        return;
+    }
+    OPENVINO_ASSERT(src_tensor->get_byte_size() == dst_tensor->get_byte_size(),
+                    "Function output tensor byte size mismatch: source=",
+                    src_tensor->get_byte_size(),
+                    ", destination=",
+                    dst_tensor->get_byte_size());
+    src_tensor->copy_to(dst_tensor._ptr);
+}
+
+}  // namespace
+
 // ====================================================================================================
 // ISubrequestAccessor Interface Implementation
 // ====================================================================================================
@@ -628,11 +663,14 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             continue;
         } else if (subm[subm_idx_from].replaced_by && !subm[subm_idx_to].replaced_by) {
             // A function call to normal subgraph connection:
-            // - Take a tensor from the storage & assign it to the reader
             const auto& iport = m_subrequests[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
             const auto& tensor = m_funcall_result.at(LinkFrom{subm_idx_from, port_idx_from});
-            subreqs[subm_idx_to]->set_tensor(iport, tensor);
-            LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to internal tensor");
+            if (should_copy_inter_request_tensor(iport)) {
+                LOG_DEBUG("Defer copying internal tensor to Subgraph[" << subm_idx_to << "]/" << iport);
+            } else {
+                subreqs[subm_idx_to]->set_tensor(iport, tensor);
+                LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to internal tensor");
+            }
         } else if (!subm[subm_idx_from].replaced_by && subm[subm_idx_to].replaced_by) {
             LOG_DEBUG("Skip: reader is a function call");
             continue;
@@ -663,12 +701,51 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             const auto& iport = subreqs[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
             const auto& oport = subreqs[subm_idx_from]->get_compiled_model()->outputs()[port_idx_from];
             const auto& tensor = subreqs[subm_idx_from]->get_tensor(oport);
-            LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to Subgraph[" << subm_idx_from << "]/"
-                                      << oport);
-            subreqs[subm_idx_to]->set_tensor(iport, tensor);
+            if (should_copy_inter_request_tensor(iport)) {
+                LOG_DEBUG("Defer copying Subgraph[" << subm_idx_from << "]/" << oport << " to Subgraph["
+                                                    << subm_idx_to << "]/" << iport);
+            } else {
+                LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to Subgraph[" << subm_idx_from
+                                          << "]/" << oport);
+                subreqs[subm_idx_to]->set_tensor(iport, tensor);
+            }
         }
     }  // for(map)
     LOG_INFO("Done");
+}
+
+void ov::npuw::JustInferRequest::copy_prev_outputs_to_subrequest_inputs(std::size_t idx) {
+    auto& subm = m_npuw_model->m_compiled_submodels;
+    if (subm[idx].replaced_by || !m_subrequests[idx]) {
+        return;
+    }
+
+    for (const auto& kvp : m_npuw_model->m_submodels_input_to_prev_output) {
+        const auto& subm_idx_to = kvp.first.first;
+        if (subm_idx_to != idx) {
+            continue;
+        }
+
+        const auto& port_idx_to = kvp.first.second;
+        const auto& subm_idx_from = kvp.second.first;
+        const auto& port_idx_from = kvp.second.second;
+        const auto& iport = m_subrequests[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
+        if (!should_copy_inter_request_tensor(iport)) {
+            continue;
+        }
+
+        if (subm[subm_idx_from].replaced_by) {
+            const auto& tensor = m_funcall_result.at(LinkFrom{subm_idx_from, port_idx_from});
+            LOG_DEBUG("Copy internal tensor to Subgraph[" << subm_idx_to << "]/" << iport);
+            copy_tensor_to_request_input(iport, tensor, m_subrequests[subm_idx_to]);
+        } else {
+            const auto& oport = m_subrequests[subm_idx_from]->get_compiled_model()->outputs()[port_idx_from];
+            const auto& tensor = m_subrequests[subm_idx_from]->get_tensor(oport);
+            LOG_DEBUG("Copy Subgraph[" << subm_idx_from << "]/" << oport << " to Subgraph[" << subm_idx_to << "]/"
+                                        << iport);
+            copy_tensor_to_request_input(iport, tensor, m_subrequests[subm_idx_to]);
+        }
+    }
 }
 
 void ov::npuw::JustInferRequest::prepare_for_infer() {
@@ -836,7 +913,11 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
                 }
             } else {
                 // Default case
-                m_subrequests[real_idx]->set_tensor(iport, i_tensor);
+                if (should_copy_inter_request_tensor(iport)) {
+                    copy_tensor_to_request_input(iport, i_tensor, m_subrequests[real_idx]);
+                } else {
+                    m_subrequests[real_idx]->set_tensor(iport, i_tensor);
+                }
             }
         }  // if (link_iter)
     }  // for(param_base)
@@ -857,7 +938,6 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     // "funcall_results" if those are produced by funcall results.
     for (std::size_t i = 0; i < func_desc.compiled_model->outputs().size(); i++) {
         LOG_DEBUG("Binding result[" << i << "]...");
-        auto& oport = func_desc.compiled_model->outputs()[i];
 
         auto result_iter = m_funcall_result.find({idx, i});
         if (result_iter == m_funcall_result.end()) {
@@ -875,15 +955,49 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
         } else if (behavior != nullptr && behavior_ctx.has_value() &&
                    behavior->bind_function_output(*behavior_ctx, i, o_tensor)) {
             continue;
-        } else if (!is_spatial) {
-            // Non-spatial case - set immediately
-            m_subrequests[real_idx]->set_tensor(oport, o_tensor);
-        } else {
+        } else if (is_spatial) {
             // Spatial case - defer
             m_spatial_io[real_idx].outputs.at(i) = o_tensor;
+        } else if (should_copy_inter_request_tensor(func_desc.compiled_model->outputs()[i])) {
+            // Keep the callee-owned output tensor and copy from it after execution.
+        } else {
+            // Non-spatial case - set immediately.
+            m_subrequests[real_idx]->set_tensor(func_desc.compiled_model->outputs()[i], o_tensor);
         }
     }
     LOG_DEBUG("Done");
+}
+
+void ov::npuw::JustInferRequest::function_epilogue(std::size_t idx) {
+    auto& comp_model_desc = m_npuw_model->m_compiled_submodels[idx];
+    if (!comp_model_desc.replaced_by) {
+        return;
+    }
+
+    const auto real_idx = comp_model_desc.replaced_by.value();
+    auto& func_desc = m_npuw_model->m_compiled_submodels[real_idx];
+    if (func_desc.spatial.has_value() || ov::npuw::moe::has_compiled_experts(func_desc.pipeline)) {
+        return;
+    }
+
+    for (std::size_t i = 0; i < func_desc.compiled_model->outputs().size(); i++) {
+        const auto& oport = func_desc.compiled_model->outputs()[i];
+        if (!should_copy_inter_request_tensor(oport)) {
+            continue;
+        }
+
+        auto result_iter = m_funcall_result.find({idx, i});
+        if (result_iter == m_funcall_result.end()) {
+            OPENVINO_THROW("Funcall output Subgraph[",
+                           idx,
+                           "]/",
+                           i,
+                           " has no tensor. Check if set_tensor() or get_tensor() was called for this output");
+        }
+
+        LOG_DEBUG("Copy Subgraph[" << idx << "]/result[" << i << "] from callee output");
+        copy_request_output_to_tensor(oport, m_subrequests[real_idx], result_iter->second);
+    }
 }
 
 void ov::npuw::JustInferRequest::initialize_moe_executor() {
@@ -931,6 +1045,7 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx) {
     if (comp_model_desc.replaced_by && !behavior_handles_function_prologue(idx)) {
         function_prologue(idx);
     }
+    copy_prev_outputs_to_subrequest_inputs(idx);
     if (behavior != nullptr) {
         auto ctx = make_behavior_context(real_idx, idx);
         behavior->prologue(ctx);
@@ -942,6 +1057,10 @@ void ov::npuw::JustInferRequest::run_subrequest_for_success(std::size_t idx) {
     unsafe_run_this_prep_next(idx, next_prepared);
 
     LOG_DEBUG("Done: " << idx << "(exec subrequest)");
+
+    if (comp_model_desc.replaced_by && !behavior_handles_function_prologue(idx)) {
+        function_epilogue(idx);
+    }
 
     dump_output_tensors(idx);  // FIXME: Called here unconditionally, need to refactor
     if (behavior != nullptr) {
