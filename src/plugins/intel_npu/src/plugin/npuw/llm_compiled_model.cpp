@@ -36,6 +36,7 @@
 #include "npuw_transformations/right_align_mask_slice_for_conv.hpp"
 #include "npuw_transformations/shrink_sliding_window_kv_cache.hpp"
 #include "npuw_transformations/slice_out_embeds.hpp"
+#include "npuw_transformations/static_sparse_attention.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/greater.hpp"
@@ -1028,6 +1029,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             LOG_DEBUG("Conv state tensors re-laid out as [batch, kernel, channels]");
         }
     }
+
+    // Applied once before the prefill model and the generate variants are cloned: the sparse attention
+    // states get one static shape (sized for the largest KV cache) shared by all of them.
+    ov::npuw::MakeSparseAttentionStatic(max_prompt_len + min_response_len).run_on_model(kvcache_model);
 
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
     auto prefill_model = kvcache_model->clone();
